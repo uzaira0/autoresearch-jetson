@@ -14,193 +14,188 @@
 
 ---
 
-## NO TEST DATA REQUIRED
+## The Cascade Problem
 
-These changes are **mechanically verifiable** — same inputs produce same outputs,
-or the change is purely infrastructure with no model behavior change.
+FLASH-TV has a 4-model pipeline where each model's output feeds the next:
+
+```
+RetinaFace (detection) → InsightFace (alignment) → AdaFace (embedding) → GazeLSTM (gaze)
+         ↓                       ↓                        ↓                      ↓
+   face bounding box      112×112 crop              512-dim vector         pitch/yaw angles
+```
+
+**Any numerical change at any stage cascades downstream.** A 1-pixel shift in face
+alignment changes the crop → changes the embedding → changes the cosine distance →
+may cross the 0.436 threshold differently → different identity decision → gaze runs
+on wrong person or doesn't run at all.
+
+This means most "same model, different backend" changes are NOT safe without
+validation. FP16, TensorRT, ONNX, and even different OpenCV resize interpolation
+all introduce floating point differences that can flip threshold decisions.
+
+---
+
+## TRULY SAFE WITHOUT TEST DATA
+
+These changes have **zero effect on model inference**. They change the environment
+or non-inference code paths only.
 
 ### Phase 0: Infrastructure (zero model risk)
 
 **0.1 — Python 3.8 → 3.11+**
-- Update venv and all pip packages
-- Fix any syntax/API deprecations (minimal — Python is backward-compatible)
-- Verify: `python -c "import torch; import cv2; print('ok')"` + run pipeline, diff log output
-- Benefit: ~25% faster CPython interpreter, security patches
-- Effort: 1-2 hours
+- Pure interpreter upgrade. Same bytecode semantics, same floating point behavior.
+- Fix any syntax deprecations (minimal).
+- Verify: import all modules, load all models successfully.
+- Benefit: ~25% faster CPython interpreter, security patches.
+- Risk: None. Python float behavior is identical across versions.
+- Effort: 1-2 hours.
 
 **0.2 — PyTorch upgrade to 2.4+**
-- Install latest PyTorch wheel for Jetson (NVIDIA provides ARM builds)
-- No code changes needed — PyTorch is backward-compatible
-- Verify: load all model checkpoints, run inference on 1 frame, compare outputs
-- Benefit: unlocks `torch.compile()`, better CUDA kernels, native FP16 path
-- Effort: 1 hour (just pip install + verify)
+- Load same checkpoint files into newer PyTorch.
+- PyTorch is backward-compatible for model loading and inference.
+- Verify: load each model, run forward pass on a single dummy tensor, confirm output shape.
+- Benefit: unlocks torch.compile() and better CUDA kernels for later phases.
+- Risk: Extremely low. Same CUDA kernels produce same results.
+- Effort: 1 hour.
 
 **0.3 — JetPack upgrade to 6.x**
-- Flash latest JetPack on the Orin
-- Ships with CUDA 12.x, TensorRT 10.x, cuDNN 9.x
-- Verify: all models load and produce same outputs
-- Effort: 2-3 hours (flash + reinstall Python environment)
+- Flash latest JetPack on the Orin.
+- Ships with CUDA 12.x, TensorRT 10.x, cuDNN 9.x.
+- Verify: all models load. Forward pass shapes correct.
+- Benefit: prerequisite for all later speed optimizations.
+- Risk: Low. Same GPU, same model weights.
+- Effort: 2-3 hours.
 
-### Phase 1: Drop MXNet (mechanical replacement)
+**0.4 — Remove 2fps throttle for benchmarking**
+- The capture loop has artificial `sleep()` to limit to 2fps.
+- Add a `--benchmark` flag that processes frames as fast as possible.
+- Verify: N/A — this only affects timing, not model outputs.
+- Risk: Zero. Just removes a sleep.
+- Effort: 30 minutes.
 
-**1.1 — Replace MXNet InsightFace with ONNX backend**
-- InsightFace switched from MXNet to ONNX years ago
-- The `model-r100-ii` face alignment model has an ONNX equivalent in the InsightFace model zoo
-- Replace `FaceModelv2` (MXNet) with `insightface.app.FaceAnalysis` (ONNX)
-- Verify: extract aligned faces from 100 test frames, pixel-diff against MXNet output (should be identical or negligible floating point diff)
-- Benefit: eliminates MXNet dependency entirely, ONNX runs faster via TensorRT
-- Effort: 3-4 hours
-- **NO test data needed** — this is a backend swap, same model weights, same alignment
+**0.5 — Dead code profiling**
+- Profile with `cProfile` to identify where wall-clock time is spent.
+- Identify unused code paths, unnecessary copies, redundant computation.
+- Don't change anything yet — just measure and document.
+- Risk: Zero. Read-only analysis.
+- Effort: 1-2 hours.
 
-**1.2 — Remove all MXNet imports and dependencies**
-- After 1.1 verified, strip MXNet from requirements, remove dead code paths
-- Effort: 30 minutes
+**0.6 — CUDA stream pipelining**
+- Run detection/embedding/gaze on separate CUDA streams.
+- This changes execution ORDER, not computation. Same ops, same inputs, same outputs.
+- Verify: diff log output against single-stream baseline on same input.
+- Risk: Very low. Identical math, just overlapped scheduling.
+- Effort: 3-4 hours.
 
-### Phase 2: Pure speed optimizations (same outputs)
-
-**2.1 — FP16 inference**
-- `model.half()` on AdaFace IR-101 and GazeLSTM
-- `input_tensor = input_tensor.half()` for all model inputs
-- Verify: compare log outputs — gaze angles within 0.01° tolerance, same detections
-- Benefit: ~2x on Jetson Ampere tensor cores
-- Effort: 1 hour
-- **NO test data needed** — numerical outputs compared directly
-
-**2.2 — torch.compile() on hot models**
-- `compiled_model = torch.compile(model, mode="reduce-overhead")`
-- Apply to AdaFace backbone and GazeLSTM
-- Verify: same outputs, measure FPS improvement
-- Benefit: 10-30% on PyTorch 2.x
-- Effort: 30 minutes
-- **NO test data needed**
-
-**2.3 — TorchScript trace**
-- `traced = torch.jit.trace(model, sample_input)` for all PyTorch models
-- Save traced models to disk for faster subsequent loads
-- Verify: same outputs on sample frames
-- Benefit: faster startup, JIT optimizations
-- Effort: 1-2 hours
-- **NO test data needed**
-
-**2.4 — TensorRT conversion**
-- Export PyTorch models → ONNX → TensorRT FP16 engines
-- Apply to: RetinaFace, AdaFace IR-101, GazeLSTM
-- Verify: same detections, same gaze angles (within tolerance)
-- Benefit: 2-4x inference speedup (the single biggest win on Jetson)
-- Effort: 4-6 hours (each model needs calibration validation)
-- **NO test data needed** — compare outputs frame-by-frame against PyTorch baseline
-
-**2.5 — GPU preprocessing pipeline**
-- Replace CPU OpenCV `resize`/`normalize` with `torchvision.transforms` on GPU
-- Eliminates CPU→GPU memory copies for preprocessing
-- Verify: same pixel values after transform
-- Effort: 2 hours
-- **NO test data needed**
-
-**2.6 — CUDA stream pipelining**
-- Run detection/embedding/gaze on separate CUDA streams
-- Overlap GPU compute with CPU work on next frame
-- Verify: same outputs (just changes execution order, not compute)
-- Effort: 3-4 hours
-- **NO test data needed**
-
-**2.7 — Batch size tuning**
-- Sweep embedding batch: 4, 8, 16, 32
-- Sweep gaze batch: 5, 10, 20
-- Autoresearch loop: try each, keep what improves FPS
-- Verify: same outputs regardless of batch size
-- Effort: 1 hour per sweep
-- **NO test data needed**
-
-**2.8 — Remove 2fps throttle for benchmarking**
-- The capture loop has artificial sleep/throttle to 2fps
-- Remove for benchmark mode to measure true pipeline capacity
-- Add `--benchmark` flag that processes all frames as fast as possible
-- Effort: 30 minutes
-- **NO test data needed**
-
-**2.9 — Dead code profiling and removal**
-- Profile with `cProfile` or `torch.cuda.Event` timers
-- Rotation variants: measure how often they find faces that upright misses
-- If <1% benefit, remove rotation code paths
-- Verify: compare detection counts with/without rotation
-- Effort: 2 hours
-- **NO test data needed** — measure detection count delta directly
+**0.7 — Batch size tuning**
+- Sweep embedding batch: 4, 8, 16, 32.
+- Sweep gaze batch: 5, 10, 20.
+- Batch size doesn't change the computation, just how many inputs are processed at once.
+- Verify: diff log output per batch size. Must be bit-identical.
+- Risk: Very low. Same computation, different grouping.
+- Effort: 1 hour per sweep.
 
 ---
 
-## TEST DATA REQUIRED
+## NEEDS TEST DATA (any change that touches model numerics)
 
-These changes **alter model behavior** — they may detect different faces, produce
-different gaze angles, or change verification decisions. Validation against
-ground-truth labels is mandatory.
+**Why:** Floating point arithmetic is not associative. Different backends, precisions,
+operator implementations, and even batch sizes can produce slightly different results.
+In a threshold-based pipeline (cosine distance vs 0.436), "slightly different" can mean
+"different identity decision." You MUST validate against ground-truth labels.
 
-### Phase 3: Threshold tuning (needs labeled data)
+### Phase 1: Drop MXNet → ONNX backend
+
+**1.1 — Replace MXNet InsightFace with ONNX backend**
+- "Same model weights" does NOT mean identical outputs across MXNet vs ONNX.
+- Different BLAS libraries, different operator implementations, different rounding.
+- The aligned face crop WILL be slightly different → cascades through entire pipeline.
+- **Requires**: labeled frames to verify identity decisions don't change.
+- Benefit: eliminates dead MXNet dependency, enables TensorRT acceleration.
+- Effort: 3-4 hours.
+
+### Phase 2: Speed optimizations (change model numerics)
+
+**2.1 — FP16 inference**
+- `model.half()` reduces precision from 32-bit to 16-bit float.
+- Gaze angles WILL change (typically 0.001°-0.1° drift).
+- Cosine distances WILL change → threshold decisions may flip.
+- **Requires**: labeled frames to verify no identity/gaze regressions.
+- Benefit: ~2x on Jetson Ampere tensor cores.
+- Effort: 1 hour.
+
+**2.2 — torch.compile()**
+- Usually bit-identical but NOT guaranteed. Uses different fused kernels.
+- **Requires**: labeled frames to verify (or at minimum, extensive output diffing).
+- Benefit: 10-30% speedup.
+- Effort: 30 minutes.
+
+**2.3 — TorchScript trace**
+- Graph-level optimizations may change operator execution order.
+- Floating point results may differ slightly.
+- **Requires**: labeled frames to verify.
+- Benefit: faster startup, JIT optimizations.
+- Effort: 1-2 hours.
+
+**2.4 — TensorRT conversion**
+- Completely different inference engine. Different kernels, different precision handling.
+- Outputs WILL differ from PyTorch. This is the biggest numerical change.
+- **Requires**: labeled frames to verify — this is mandatory.
+- Benefit: 2-4x inference speedup (the single biggest win on Jetson).
+- Effort: 4-6 hours.
+
+**2.5 — GPU preprocessing pipeline**
+- Different resize/normalize implementation (torchvision vs OpenCV).
+- Interpolation differences → different pixel values → cascades through models.
+- **Requires**: labeled frames to verify.
+- Benefit: eliminates CPU→GPU copies.
+- Effort: 2 hours.
+
+**2.6 — Dead code removal (rotation variants)**
+- Rotation code paths detect faces that upright detection misses.
+- Removing them changes detection behavior (fewer detections on rotated faces).
+- **Requires**: labeled frames to measure detection recall impact.
+- Effort: 2 hours.
+
+### Phase 3: Threshold tuning
 
 **3.1 — Verification threshold sweep**
-- Current: hardcoded 0.436 cosine distance
-- Sweep: 0.3 → 0.6 in 0.01 steps
-- Metric: F1 score on labeled identity data (true positive ID matches)
-- Autoresearch target: maximize F1 while keeping FPS constant
-- **Requires**: labeled frames with known identities (who is in each frame)
+- Current: hardcoded 0.436 cosine distance.
+- Sweep: 0.3 → 0.6 in 0.01 steps.
+- Metric: F1 score on labeled identity data.
+- **Requires**: labeled frames with known identities.
 
 **3.2 — Detection threshold sweep**
-- Current: 0.15 confidence
-- Sweep: 0.05 → 0.5
-- Metric: precision/recall on labeled face bounding boxes
-- **Requires**: frames with annotated face bounding boxes
+- Current: 0.15 confidence.
+- Sweep: 0.05 → 0.5.
+- Metric: precision/recall on labeled face bounding boxes.
+- **Requires**: frames with annotated face bounding boxes.
 
 **3.3 — Area threshold tuning**
-- Current: 35px minimum face area
-- Sweep: 20 → 100
-- Metric: detection recall at various distances
-- **Requires**: labeled frames with faces at known distances
+- Current: 35px minimum face area.
+- Sweep: 20 → 100.
+- **Requires**: labeled frames at various distances.
 
-### Phase 4: Model architecture changes (needs labeled data)
+### Phase 4: Model architecture changes
 
 **4.1 — IR-101 → IR-50 backbone**
-- Half the layers in the face embedding model
-- Faster inference but potentially lower verification accuracy
-- Metric: verification F1 score must stay ≥ baseline
-- **Requires**: labeled identity pairs for verification accuracy
-- Benefit: ~40% faster embedding inference
-- Effort: 2-3 hours (swap backbone, load IR-50 pretrained weights, benchmark)
+- Different model, different accuracy characteristics.
+- **Requires**: labeled identity pairs for verification accuracy.
 
 **4.2 — Embedding dimension 512 → 256**
-- Smaller embeddings = faster distance computation + less memory
-- May lose discriminative power for similar-looking faces
-- Metric: verification F1 at various thresholds
-- **Requires**: labeled identity data with known hard pairs (siblings)
-- Effort: 3-4 hours (retrain or find pre-trained 256-dim model)
+- **Requires**: labeled identity data with hard pairs (siblings).
 
 **4.3 — GazeLSTM temporal window: 7 → 3 or 5 frames**
-- Fewer frames per gaze prediction = faster + lower latency
-- May lose temporal smoothing / accuracy
-- Metric: gaze angular error on labeled gaze data
-- **Requires**: frames with ground-truth gaze angles
-- Effort: 2 hours (modify input pipeline, benchmark)
+- **Requires**: frames with ground-truth gaze angles.
 
 **4.4 — Replace RetinaFace with SCRFD**
-- SCRFD is from the same team (InsightFace), 2x faster, better accuracy
-- Metric: detection mAP on labeled face data
-- **Requires**: annotated face bounding boxes for validation
-- Benefit: 2x detection speed with equal or better accuracy
-- Effort: 4-6 hours (swap detector, validate outputs)
+- **Requires**: annotated face bounding boxes.
 
 **4.5 — Replace GazeLSTM with L2CS-Net or GazeTR**
-- Modern gaze estimation architectures
-- L2CS-Net: ResNet-50 + binned classification (simpler, faster)
-- GazeTR: transformer-based (potentially more accurate)
-- Metric: gaze angular error
-- **Requires**: labeled gaze data
-- Effort: 1-2 days (new model integration, benchmark)
+- **Requires**: labeled gaze data.
 
 **4.6 — End-to-end model distillation**
-- Train a single smaller model that mimics the full 4-model pipeline
-- Input: raw frame → Output: identity + gaze
-- Metric: all metrics must match or exceed the pipeline
-- **Requires**: large labeled dataset for training
-- Effort: 1-2 weeks
+- **Requires**: large labeled dataset for training.
 
 ---
 
@@ -208,32 +203,41 @@ ground-truth labels is mandatory.
 
 ```
 WITHOUT TEST DATA (do now):
-  0.1  Python 3.11        ──┐
-  0.2  PyTorch 2.4+        │  Infrastructure
-  0.3  JetPack 6.x        ──┘
-  1.1  Drop MXNet → ONNX  ──── Biggest dependency win
-  2.1  FP16 inference      ──┐
-  2.2  torch.compile()      │
-  2.4  TensorRT conversion  │  Speed (autoresearch loop)
-  2.8  Remove 2fps throttle │
-  2.5  GPU preprocessing   ──┘
+  0.1  Python 3.11         ──┐
+  0.2  PyTorch 2.4+         │  Infrastructure (zero model risk)
+  0.3  JetPack 6.x          │
+  0.4  Remove 2fps throttle │
+  0.5  Dead code profiling  │
+  0.6  CUDA stream pipeline │
+  0.7  Batch size tuning   ──┘
 
-WITH TEST DATA (do when available):
-  3.1  Threshold sweep     ──── Quick wins
-  4.4  SCRFD detector      ──┐
-  4.1  IR-50 backbone       │  Architecture (autoresearch loop)
-  4.3  Temporal window      │
-  4.5  Modern gaze model   ──┘
+WHEN TEST DATA AVAILABLE (validation required):
+  1.1  Drop MXNet → ONNX   ──── Dependency cleanup
+  2.1  FP16 inference       ──┐
+  2.2  torch.compile()       │
+  2.4  TensorRT conversion   │  Speed (autoresearch loop)
+  2.5  GPU preprocessing    ──┘
+  2.6  Remove rotation       ──── Measure recall impact
+  3.*  Threshold sweeps      ──── Accuracy tuning
+  4.*  Architecture swaps    ──── Biggest changes last
 ```
 
 ## Expected Impact
 
-| Phase | Expected FPS gain | Requires test data |
-|-------|------------------|--------------------|
-| Phase 0 (infra) | +25% (Python speedup) | No |
-| Phase 1 (drop MXNet) | +10-20% (ONNX faster) | No |
-| Phase 2 (speed opts) | +200-400% (TensorRT + FP16) | No |
-| Phase 3 (thresholds) | 0% FPS, better accuracy | Yes |
-| Phase 4 (architecture) | +50-100% additional | Yes |
+| Phase | Expected FPS gain | Requires test data | Risk |
+|-------|------------------|--------------------|------|
+| Phase 0 (infra) | +25% (Python + batching) | **No** | Zero |
+| Phase 1 (drop MXNet) | +10-20% | **Yes** | Medium (cascade) |
+| Phase 2 (speed opts) | +200-400% | **Yes** | Medium (numerics) |
+| Phase 3 (thresholds) | 0% FPS, better accuracy | **Yes** | Low |
+| Phase 4 (architecture) | +50-100% additional | **Yes** | High |
 
-**Conservative estimate**: Phases 0-2 alone should take the pipeline from ~2 FPS to ~10-15 FPS without any accuracy risk. With TensorRT, potentially 20+ FPS.
+**Without test data (Phase 0 only):** ~2 FPS → ~2.5-3 FPS. Modest, but sets up
+the foundation for everything else.
+
+**With test data (Phases 0-2):** ~2 FPS → 10-20 FPS. TensorRT is the big win
+but cannot be validated without labeled data.
+
+**The honest answer:** Most of the real speed gains (FP16, TensorRT, ONNX) change
+model numerics and need test data to validate. Phase 0 is genuinely safe but gives
+you infrastructure, not speed. Get the test data.
