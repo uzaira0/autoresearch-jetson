@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# Data files — never commit
+*.npy
+families/*/*.txt
+families/*/*.csv

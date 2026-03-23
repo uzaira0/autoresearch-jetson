@@ -1,0 +1,6 @@
+end_frame: 107000
+tv:
+  size: 32.0
+  cam_height: 43.0
+  tv_height: 50.0
+  view_dist: 64.0
